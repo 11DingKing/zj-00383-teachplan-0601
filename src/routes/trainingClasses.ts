@@ -8,6 +8,7 @@ import {
   getPaginationParams,
   buildPaginationResult,
   checkRoomScheduleConflict,
+  getScheduleCount,
 } from "../utils/helpers";
 import { TrainingClass, ClassSchedule, ClassStatus } from "../types";
 
@@ -127,6 +128,20 @@ router.post(
       return sendError(res, `班级容量不能超过培训室容量(${room.capacity})`);
 
     const scheduleList = schedules && Array.isArray(schedules) ? schedules : [];
+    if (scheduleList.length === 0) {
+      return sendError(res, "创建班级必须提供至少一条课程安排");
+    }
+    for (const sched of scheduleList) {
+      if (!sched.date || !sched.start_time || !sched.end_time) {
+        return sendError(res, "每条课程安排必须包含日期、开始时间和结束时间");
+      }
+      if (sched.date < start_date || sched.date > end_date) {
+        return sendError(
+          res,
+          `课程安排日期 ${sched.date} 必须在班级起止日期 ${start_date} 至 ${end_date} 之间`,
+        );
+      }
+    }
     const conflict = checkRoomScheduleConflict(room_id, scheduleList);
     if (conflict.conflict) return sendError(res, conflict.message);
 
@@ -375,6 +390,23 @@ router.post(
 
     const enrolled = getEnrolledCount(req.params.id);
     if (enrolled === 0) return sendError(res, "没有正式学员，无法开班");
+
+    const scheduleCount = getScheduleCount(req.params.id);
+    if (scheduleCount === 0) {
+      return sendError(res, "班级没有课程安排，无法开班，请先排课");
+    }
+
+    const roomOccupancy = db
+      .prepare(
+        `
+      SELECT COUNT(*) as count FROM class_schedules cs
+      WHERE cs.class_id = ?
+    `,
+      )
+      .get(req.params.id) as any;
+    if (roomOccupancy.count === 0) {
+      return sendError(res, "未查询到培训室占用记录，无法开班");
+    }
 
     db.prepare(
       `UPDATE training_classes SET status='started', updated_at=datetime('now') WHERE id=?`,

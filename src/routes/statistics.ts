@@ -1,6 +1,13 @@
 import { Router, Request, Response } from "express";
 import db from "../db/database";
-import { sendResponse, sendError, handleAsync } from "../utils/helpers";
+import {
+  sendResponse,
+  sendError,
+  handleAsync,
+  calcAttendanceRate,
+  hasSufficientAttendance,
+  MIN_REQUIRED_ATTENDANCE_RATE,
+} from "../utils/helpers";
 
 const router = Router();
 
@@ -54,29 +61,23 @@ router.get(
         .get(...classCondParams) as any
     ).c;
 
-    const totalExamined = (
-      db
-        .prepare(
-          `
-    SELECT COUNT(*) as c FROM graduation_exams ge
+    const allExams = db
+      .prepare(
+        `
+    SELECT ge.*, tc.id as real_class_id FROM graduation_exams ge
     JOIN training_classes tc ON ge.class_id = tc.id
     WHERE ge.result != 'pending' ${classDateWhere.replace(/tc\./g, "tc.")}
   `,
-        )
-        .get(...classCondParams) as any
-    ).c;
+      )
+      .all(...classCondParams) as any[];
 
-    const totalPassed = (
-      db
-        .prepare(
-          `
-    SELECT COUNT(*) as c FROM graduation_exams ge
-    JOIN training_classes tc ON ge.class_id = tc.id
-    WHERE ge.result = 'passed' ${classDateWhere.replace(/tc\./g, "tc.")}
-  `,
-        )
-        .get(...classCondParams) as any
-    ).c;
+    const eligibleExams = allExams.filter((e) =>
+      hasSufficientAttendance(e.class_id, e.housekeeper_id),
+    );
+    const totalExamined = eligibleExams.length;
+    const totalPassed = eligibleExams.filter(
+      (e) => e.result === "passed",
+    ).length;
 
     const skillRecordsCount = (
       db
@@ -138,6 +139,8 @@ router.get(
       skill_records_created: skillRecordsCount,
       total_training_hours: totalTrainingHours,
       avg_hours_per_person: avgHoursPerPerson,
+      min_required_attendance_rate: MIN_REQUIRED_ATTENDANCE_RATE,
+      pass_rate_note: "通过率仅统计出勤率达标学员",
     });
   }),
 );
@@ -160,7 +163,7 @@ router.get(
     const dateWhere =
       dateConditions.length > 0 ? "WHERE " + dateConditions.join(" AND ") : "";
 
-    const rows = db
+    const rawRows = db
       .prepare(
         `
     SELECT
@@ -171,30 +174,78 @@ router.get(
       COALESCE(SUM(tc.total_hours), 0) as total_class_hours,
       COALESCE(SUM(CASE WHEN r.status = 'enrolled' THEN tc.total_hours ELSE 0 END), 0) as total_person_hours,
       COUNT(DISTINCT CASE WHEN r.status = 'enrolled' THEN r.housekeeper_id ELSE NULL END) as unique_trainees,
-      COUNT(DISTINCT CASE WHEN ge.result = 'passed' THEN ge.housekeeper_id ELSE NULL END) as passed_count,
-      COUNT(DISTINCT CASE WHEN ge.result != 'pending' THEN ge.housekeeper_id ELSE NULL END) as examined_count
+      ge.class_id as exam_class_id,
+      ge.housekeeper_id as exam_housekeeper_id,
+      ge.result as exam_result
     FROM training_types tt
     LEFT JOIN training_classes tc ON tc.training_type_id = tt.id
       ${dateConditions.length > 0 ? "AND " + dateConditions.map((c) => c.replace("tc.", "tc.")).join(" AND ") : ""}
     LEFT JOIN registrations r ON r.class_id = tc.id
     LEFT JOIN graduation_exams ge ON ge.class_id = tc.id AND ge.housekeeper_id = r.housekeeper_id
-    GROUP BY tt.id, tt.name
+    GROUP BY tt.id, tt.name, ge.class_id, ge.housekeeper_id, ge.result
     ORDER BY class_count DESC
   `,
       )
       .all(...dateParams);
 
-    const result = rows.map((r: any) => ({
-      ...r,
-      avg_hours_per_person:
-        r.unique_trainees > 0
-          ? Math.round((r.total_person_hours / r.unique_trainees) * 100) / 100
-          : 0,
-      pass_rate:
-        r.examined_count > 0
-          ? Math.round((r.passed_count / r.examined_count) * 10000) / 100
-          : 0,
-    }));
+    const agg: Map<string, any> = new Map();
+    for (const row of rawRows as any[]) {
+      const key = row.training_type_id;
+      if (!agg.has(key)) {
+        agg.set(key, {
+          training_type_id: row.training_type_id,
+          training_type_name: row.training_type_name,
+          class_count: row.class_count,
+          enrollment_count: row.enrollment_count,
+          total_class_hours: row.total_class_hours,
+          total_person_hours: row.total_person_hours,
+          unique_trainees: row.unique_trainees,
+          _examined: new Set(),
+          _passed: new Set(),
+        });
+      }
+      const entry = agg.get(key)!;
+      if (
+        row.exam_class_id &&
+        row.exam_housekeeper_id &&
+        row.exam_result &&
+        row.exam_result !== "pending"
+      ) {
+        const eligible = hasSufficientAttendance(
+          row.exam_class_id,
+          row.exam_housekeeper_id,
+        );
+        if (eligible) {
+          const personKey = `${row.exam_class_id}-${row.exam_housekeeper_id}`;
+          entry._examined.add(personKey);
+          if (row.exam_result === "passed") {
+            entry._passed.add(personKey);
+          }
+        }
+      }
+    }
+
+    const result = Array.from(agg.values()).map((r: any) => {
+      const passed_count = r._passed.size;
+      const examined_count = r._examined.size;
+      delete r._examined;
+      delete r._passed;
+      return {
+        ...r,
+        passed_count,
+        examined_count,
+        avg_hours_per_person:
+          r.unique_trainees > 0
+            ? Math.round((r.total_person_hours / r.unique_trainees) * 100) / 100
+            : 0,
+        pass_rate:
+          examined_count > 0
+            ? Math.round((passed_count / examined_count) * 10000) / 100
+            : 0,
+        min_required_attendance_rate: MIN_REQUIRED_ATTENDANCE_RATE,
+        pass_rate_note: "通过率仅统计出勤率达标学员",
+      };
+    });
 
     sendResponse(res, true, "按培训类型统计成功", result);
   }),
@@ -233,6 +284,18 @@ router.get(
       FROM class_schedules cs
       JOIN training_classes tc ON cs.class_id = tc.id
       WHERE tc.room_id = ? AND cs.date BETWEEN ? AND ?
+        AND tc.status != 'enrolling'
+    `,
+        )
+        .all(room.id, sd, ed);
+
+      const allSchedules = db
+        .prepare(
+          `
+      SELECT cs.date, cs.start_time, cs.end_time, tc.status
+      FROM class_schedules cs
+      JOIN training_classes tc ON cs.class_id = tc.id
+      WHERE tc.room_id = ? AND cs.date BETWEEN ? AND ?
     `,
         )
         .all(room.id, sd, ed);
@@ -257,7 +320,10 @@ router.get(
         available_hours: totalAvailableHoursPerRoom,
         scheduled_hours: usedHours,
         schedule_count: schedules.length,
+        total_schedule_count: allSchedules.length,
+        excluded_enrolling_count: allSchedules.length - schedules.length,
         utilization_rate: Math.min(100, utilization),
+        utilization_note: "使用率仅统计已开班/培训中/已结业班级",
       };
     });
 

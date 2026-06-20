@@ -96,3 +96,56 @@ export function checkRoomScheduleConflict(
   }
   return { conflict: false, message: "" };
 }
+
+export const MIN_REQUIRED_ATTENDANCE_RATE = 80;
+
+export function getScheduleCount(classId: string): number {
+  return (
+    db
+      .prepare(
+        `SELECT COUNT(*) as count FROM class_schedules WHERE class_id = ?`,
+      )
+      .get(classId) as any
+  ).count;
+}
+
+export function calcAttendanceRate(
+  classId: string,
+  housekeeperId: string,
+): number {
+  const rows = db
+    .prepare(
+      `
+    SELECT status FROM attendances
+    WHERE class_id = ? AND housekeeper_id = ?
+  `,
+    )
+    .all(classId, housekeeperId) as any[];
+  if (rows.length === 0) return 0;
+  const valid = rows.filter(
+    (r) => r.status === "present" || r.status === "leave",
+  ).length;
+  return Math.round((valid / rows.length) * 10000) / 100;
+}
+
+export function hasSufficientAttendance(
+  classId: string,
+  housekeeperId: string,
+): boolean {
+  const scheduleCount = getScheduleCount(classId);
+  if (scheduleCount === 0) return false;
+
+  const attendanceRows = db
+    .prepare(
+      `SELECT status FROM attendances WHERE class_id = ? AND housekeeper_id = ?`,
+    )
+    .all(classId, housekeeperId) as any[];
+
+  if (attendanceRows.length < scheduleCount) return false;
+
+  const validAttendance = attendanceRows.filter(
+    (r) => r.status === "present" || r.status === "leave",
+  ).length;
+  const rate = (validAttendance / scheduleCount) * 100;
+  return rate >= MIN_REQUIRED_ATTENDANCE_RATE;
+}
