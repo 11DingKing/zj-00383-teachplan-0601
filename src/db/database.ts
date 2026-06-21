@@ -88,6 +88,7 @@ function initializeDatabase() {
       housekeeper_id TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'enrolled' CHECK(status IN ('enrolled', 'waiting', 'cancelled')),
       wait_position INTEGER,
+      promoted_at TEXT,
       registered_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (class_id) REFERENCES training_classes(id) ON DELETE CASCADE,
       FOREIGN KEY (housekeeper_id) REFERENCES housekeepers(id),
@@ -101,11 +102,48 @@ function initializeDatabase() {
       housekeeper_id TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'present' CHECK(status IN ('present', 'absent', 'leave')),
       remark TEXT,
+      is_makeup INTEGER NOT NULL DEFAULT 0,
+      original_schedule_id TEXT,
+      makeup_schedule_id TEXT,
       recorded_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (class_id) REFERENCES training_classes(id) ON DELETE CASCADE,
-      FOREIGN KEY (schedule_id) REFERENCES class_schedules(id) ON DELETE CASCADE,
       FOREIGN KEY (housekeeper_id) REFERENCES housekeepers(id),
+      FOREIGN KEY (original_schedule_id) REFERENCES class_schedules(id) ON DELETE SET NULL,
+      FOREIGN KEY (makeup_schedule_id) REFERENCES makeup_schedules(id) ON DELETE SET NULL,
       UNIQUE(schedule_id, housekeeper_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS makeup_schedules (
+      id TEXT PRIMARY KEY,
+      class_id TEXT NOT NULL,
+      original_schedule_id TEXT NOT NULL,
+      date TEXT NOT NULL,
+      start_time TEXT NOT NULL,
+      end_time TEXT NOT NULL,
+      content TEXT,
+      room_id TEXT,
+      instructor_id TEXT,
+      created_by TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (class_id) REFERENCES training_classes(id) ON DELETE CASCADE,
+      FOREIGN KEY (original_schedule_id) REFERENCES class_schedules(id) ON DELETE CASCADE,
+      FOREIGN KEY (room_id) REFERENCES training_rooms(id),
+      FOREIGN KEY (instructor_id) REFERENCES instructors(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS makeup_registrations (
+      id TEXT PRIMARY KEY,
+      makeup_schedule_id TEXT NOT NULL,
+      housekeeper_id TEXT NOT NULL,
+      original_schedule_id TEXT NOT NULL,
+      class_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'scheduled' CHECK(status IN ('scheduled', 'completed', 'cancelled')),
+      registered_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (makeup_schedule_id) REFERENCES makeup_schedules(id) ON DELETE CASCADE,
+      FOREIGN KEY (housekeeper_id) REFERENCES housekeepers(id),
+      FOREIGN KEY (original_schedule_id) REFERENCES class_schedules(id) ON DELETE CASCADE,
+      FOREIGN KEY (class_id) REFERENCES training_classes(id) ON DELETE CASCADE,
+      UNIQUE(makeup_schedule_id, housekeeper_id)
     );
 
     CREATE TABLE IF NOT EXISTS graduation_exams (
@@ -117,9 +155,13 @@ function initializeDatabase() {
       result TEXT NOT NULL DEFAULT 'pending' CHECK(result IN ('passed', 'failed', 'pending')),
       certificate_no TEXT UNIQUE,
       examined_by TEXT,
+      is_retake INTEGER NOT NULL DEFAULT 0,
+      retake_count INTEGER NOT NULL DEFAULT 0,
+      parent_exam_id TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (class_id) REFERENCES training_classes(id) ON DELETE CASCADE,
       FOREIGN KEY (housekeeper_id) REFERENCES housekeepers(id),
+      FOREIGN KEY (parent_exam_id) REFERENCES graduation_exams(id) ON DELETE SET NULL,
       UNIQUE(class_id, housekeeper_id)
     );
 
@@ -134,11 +176,22 @@ function initializeDatabase() {
       end_date TEXT NOT NULL,
       total_hours INTEGER NOT NULL DEFAULT 0,
       attendance_rate REAL NOT NULL DEFAULT 0,
+      had_makeup INTEGER NOT NULL DEFAULT 0,
+      had_retake INTEGER NOT NULL DEFAULT 0,
+      was_waiting_promoted INTEGER NOT NULL DEFAULT 0,
+      makeup_count INTEGER NOT NULL DEFAULT 0,
+      retake_count INTEGER NOT NULL DEFAULT 0,
       recorded_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (housekeeper_id) REFERENCES housekeepers(id),
       FOREIGN KEY (class_id) REFERENCES training_classes(id),
       FOREIGN KEY (training_type_id) REFERENCES training_types(id)
     );
+
+    CREATE INDEX IF NOT EXISTS idx_makeup_schedules_class ON makeup_schedules(class_id);
+    CREATE INDEX IF NOT EXISTS idx_makeup_schedules_original ON makeup_schedules(original_schedule_id);
+    CREATE INDEX IF NOT EXISTS idx_makeup_registrations_schedule ON makeup_registrations(makeup_schedule_id);
+    CREATE INDEX IF NOT EXISTS idx_makeup_registrations_housekeeper ON makeup_registrations(housekeeper_id);
+    CREATE INDEX IF NOT EXISTS idx_attendances_makeup ON attendances(is_makeup);
 
     CREATE INDEX IF NOT EXISTS idx_classes_type ON training_classes(training_type_id);
     CREATE INDEX IF NOT EXISTS idx_classes_status ON training_classes(status);

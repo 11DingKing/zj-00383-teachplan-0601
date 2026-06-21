@@ -42,7 +42,7 @@ function promoteNextWaiter(classId: string): any | null {
   const waiter = db
     .prepare(
       `
-    SELECT r.*, h.name as housekeeper_name
+    SELECT r.*, h.name as housekeeper_name, h.phone as housekeeper_phone
     FROM registrations r
     JOIN housekeepers h ON r.housekeeper_id = h.id
     WHERE r.class_id = ? AND r.status = 'waiting'
@@ -54,9 +54,15 @@ function promoteNextWaiter(classId: string): any | null {
   if (waiter) {
     const w: any = waiter;
     db.prepare(
-      `UPDATE registrations SET status = 'enrolled', wait_position = NULL WHERE id = ?`,
+      `UPDATE registrations SET status = 'enrolled', wait_position = NULL, promoted_at = datetime('now') WHERE id = ?`,
     ).run(w.id);
     recalcWaitPositions(classId);
+    const schedules = db
+      .prepare(
+        `SELECT * FROM class_schedules WHERE class_id = ? ORDER BY date, start_time`,
+      )
+      .all(classId);
+    w.schedules = schedules;
   }
   return waiter;
 }
@@ -240,12 +246,13 @@ router.delete(
     if (cls.status === "completed")
       return sendError(res, "班级已结业，无法取消报名");
 
+    let promotedWaiter: any = null;
     const tx = db.transaction(() => {
       db.prepare(
         `UPDATE registrations SET status = 'cancelled', wait_position = NULL WHERE id = ?`,
       ).run(req.params.id);
       if (reg.status === "enrolled") {
-        promoteNextWaiter(reg.class_id);
+        promotedWaiter = promoteNextWaiter(reg.class_id);
       } else {
         recalcWaitPositions(reg.class_id);
       }
@@ -253,7 +260,25 @@ router.delete(
 
     try {
       tx();
-      sendResponse(res, true, "取消成功，候补名额已自动递补");
+      const data: any = { message: "取消成功" };
+      if (promotedWaiter) {
+        data.promoted_waiter = {
+          id: promotedWaiter.id,
+          housekeeper_id: promotedWaiter.housekeeper_id,
+          housekeeper_name: promotedWaiter.housekeeper_name,
+          housekeeper_phone: promotedWaiter.housekeeper_phone,
+          promoted_at: new Date().toISOString(),
+          schedules: promotedWaiter.schedules,
+        };
+        sendResponse(
+          res,
+          true,
+          `取消成功，候补学员 ${promotedWaiter.housekeeper_name} 已自动转正并分配课程安排`,
+          data,
+        );
+      } else {
+        sendResponse(res, true, "取消成功，无候补学员可递补", data);
+      }
     } catch (err: any) {
       sendError(res, "取消失败: " + err.message);
     }

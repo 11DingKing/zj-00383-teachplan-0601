@@ -113,39 +113,168 @@ export function calcAttendanceRate(
   classId: string,
   housekeeperId: string,
 ): number {
-  const rows = db
+  const scheduleCount = getScheduleCount(classId);
+  if (scheduleCount === 0) return 0;
+
+  const attendanceRows = db
     .prepare(
-      `
-    SELECT status FROM attendances
-    WHERE class_id = ? AND housekeeper_id = ?
-  `,
+      `SELECT schedule_id, status, is_makeup, original_schedule_id FROM attendances WHERE class_id = ? AND housekeeper_id = ?`,
     )
     .all(classId, housekeeperId) as any[];
-  if (rows.length === 0) return 0;
-  const valid = rows.filter(
-    (r) => r.status === "present" || r.status === "leave",
-  ).length;
-  return Math.round((valid / rows.length) * 10000) / 100;
+
+  const originalAttendance = new Map<string, string>();
+  const makeupCovered = new Set<string>();
+
+  for (const row of attendanceRows) {
+    if (row.is_makeup === 1 && row.original_schedule_id) {
+      if (row.status === "present" || row.status === "leave") {
+        makeupCovered.add(row.original_schedule_id);
+      }
+    } else {
+      originalAttendance.set(row.schedule_id, row.status);
+    }
+  }
+
+  let validCount = 0;
+  const schedules = db
+    .prepare(`SELECT id FROM class_schedules WHERE class_id = ?`)
+    .all(classId) as any[];
+
+  for (const sched of schedules) {
+    const schedId = sched.id;
+    const status = originalAttendance.get(schedId);
+    if (
+      (status && (status === "present" || status === "leave")) ||
+      makeupCovered.has(schedId)
+    ) {
+      validCount++;
+    }
+  }
+
+  return Math.round((validCount / scheduleCount) * 10000) / 100;
 }
 
 export function hasSufficientAttendance(
   classId: string,
   housekeeperId: string,
 ): boolean {
-  const scheduleCount = getScheduleCount(classId);
-  if (scheduleCount === 0) return false;
-
-  const attendanceRows = db
-    .prepare(
-      `SELECT status FROM attendances WHERE class_id = ? AND housekeeper_id = ?`,
-    )
-    .all(classId, housekeeperId) as any[];
-
-  if (attendanceRows.length < scheduleCount) return false;
-
-  const validAttendance = attendanceRows.filter(
-    (r) => r.status === "present" || r.status === "leave",
-  ).length;
-  const rate = (validAttendance / scheduleCount) * 100;
+  const rate = calcAttendanceRate(classId, housekeeperId);
   return rate >= MIN_REQUIRED_ATTENDANCE_RATE;
+}
+
+export function getMakeupCount(classId: string, housekeeperId: string): number {
+  return (
+    db
+      .prepare(
+        `SELECT COUNT(*) as count FROM attendances WHERE class_id = ? AND housekeeper_id = ? AND is_makeup = 1 AND status IN ('present', 'leave')`,
+      )
+      .get(classId, housekeeperId) as any
+  ).count;
+}
+
+export function hasMakeup(classId: string, housekeeperId: string): boolean {
+  return getMakeupCount(classId, housekeeperId) > 0;
+}
+
+export function getRetakeCount(classId: string, housekeeperId: string): number {
+  const exam = db
+    .prepare(
+      `SELECT retake_count FROM graduation_exams WHERE class_id = ? AND housekeeper_id = ?`,
+    )
+    .get(classId, housekeeperId) as any;
+  return exam ? exam.retake_count || 0 : 0;
+}
+
+export function hasRetake(classId: string, housekeeperId: string): boolean {
+  return getRetakeCount(classId, housekeeperId) > 0;
+}
+
+export function isWaitingPromoted(
+  classId: string,
+  housekeeperId: string,
+): boolean {
+  const reg = db
+    .prepare(
+      `SELECT promoted_at FROM registrations WHERE class_id = ? AND housekeeper_id = ? AND status = 'enrolled'`,
+    )
+    .get(classId, housekeeperId) as any;
+  return !!(reg && reg.promoted_at);
+}
+
+export function getFinalExamResult(
+  classId: string,
+  housekeeperId: string,
+): { result: string; score: number; certificate_no?: string } | null {
+  const exam = db
+    .prepare(
+      `SELECT result, score, certificate_no FROM graduation_exams WHERE class_id = ? AND housekeeper_id = ?`,
+    )
+    .get(classId, housekeeperId) as any;
+  if (!exam) return null;
+  return {
+    result: exam.result,
+    score: exam.score,
+    certificate_no: exam.certificate_no || undefined,
+  };
+}
+
+export function getAbsentList(classId: string): any[] {
+  const schedules = db
+    .prepare(
+      `SELECT id, date, content FROM class_schedules WHERE class_id = ? ORDER BY date, start_time`,
+    )
+    .all(classId) as any[];
+
+  const enrolled = db
+    .prepare(
+      `SELECT r.housekeeper_id, h.name, h.phone
+       FROM registrations r
+       JOIN housekeepers h ON r.housekeeper_id = h.id
+       WHERE r.class_id = ? AND r.status = 'enrolled'`,
+    )
+    .all(classId) as any[];
+
+  const result: any[] = [];
+  for (const sched of schedules) {
+    for (const hk of enrolled) {
+      const att = db
+        .prepare(
+          `SELECT status, is_makeup, makeup_schedule_id FROM attendances
+           WHERE (schedule_id = ? OR (original_schedule_id = ? AND is_makeup = 1))
+           AND housekeeper_id = ?`,
+        )
+        .all(sched.id, sched.id, hk.housekeeper_id) as any[];
+
+      let isAbsent = true;
+      for (const a of att) {
+        if (a.status === "present" || a.status === "leave") {
+          isAbsent = false;
+          break;
+        }
+      }
+
+      const makeupScheduled = db
+        .prepare(
+          `SELECT mr.*, ms.date, ms.start_time, ms.end_time, ms.content as makeup_content
+           FROM makeup_registrations mr
+           JOIN makeup_schedules ms ON mr.makeup_schedule_id = ms.id
+           WHERE mr.original_schedule_id = ? AND mr.housekeeper_id = ? AND mr.status != 'cancelled'`,
+        )
+        .get(sched.id, hk.housekeeper_id);
+
+      if (isAbsent) {
+        result.push({
+          schedule_id: sched.id,
+          schedule_date: sched.date,
+          schedule_content: sched.content,
+          housekeeper_id: hk.housekeeper_id,
+          housekeeper_name: hk.name,
+          housekeeper_phone: hk.phone,
+          makeup_scheduled: !!makeupScheduled,
+          makeup_info: makeupScheduled || null,
+        });
+      }
+    }
+  }
+  return result;
 }

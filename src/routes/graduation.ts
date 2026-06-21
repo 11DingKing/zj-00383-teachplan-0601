@@ -9,6 +9,11 @@ import {
   hasSufficientAttendance,
   MIN_REQUIRED_ATTENDANCE_RATE,
   getScheduleCount,
+  getMakeupCount,
+  hasMakeup,
+  getRetakeCount,
+  hasRetake,
+  isWaitingPromoted,
 } from "../utils/helpers";
 import { GraduationExam, ExamResult } from "../types";
 
@@ -27,8 +32,14 @@ function generateCertificateNo(): string {
 router.post(
   "/exam",
   handleAsync(async (req: Request, res: Response) => {
-    const { class_id, housekeeper_id, exam_date, score, examined_by } =
-      req.body;
+    const {
+      class_id,
+      housekeeper_id,
+      exam_date,
+      score,
+      examined_by,
+      is_retake,
+    } = req.body;
     if (
       !class_id ||
       !housekeeper_id ||
@@ -73,15 +84,31 @@ router.post(
 
     const existing = db
       .prepare(
-        `SELECT id FROM graduation_exams WHERE class_id = ? AND housekeeper_id = ?`,
+        `SELECT id, retake_count, result as prev_result FROM graduation_exams WHERE class_id = ? AND housekeeper_id = ?`,
       )
       .get(class_id, housekeeper_id) as any;
+
+    let retakeCount = 0;
+    let isRetakeFlag = 0;
+    let parentExamId: string | null = null;
+
+    if (existing) {
+      if (existing.prev_result === "passed") {
+        return sendError(res, "该学员已通过考核，无需补考");
+      }
+      retakeCount = (existing.retake_count || 0) + 1;
+      isRetakeFlag = 1;
+      parentExamId = existing.id;
+    } else if (is_retake) {
+      isRetakeFlag = 1;
+      retakeCount = 1;
+    }
 
     const tx = db.transaction(() => {
       if (existing) {
         db.prepare(
           `
-        UPDATE graduation_exams SET exam_date=?, score=?, result=?, certificate_no=?, examined_by=?
+        UPDATE graduation_exams SET exam_date=?, score=?, result=?, certificate_no=?, examined_by=?, is_retake=?, retake_count=?, parent_exam_id=?
         WHERE id = ?
       `,
         ).run(
@@ -90,13 +117,16 @@ router.post(
           result,
           certificateNo || null,
           examined_by || "",
+          isRetakeFlag,
+          retakeCount,
+          parentExamId,
           existing.id,
         );
       } else {
         db.prepare(
           `
-        INSERT INTO graduation_exams (id, class_id, housekeeper_id, exam_date, score, result, certificate_no, examined_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO graduation_exams (id, class_id, housekeeper_id, exam_date, score, result, certificate_no, examined_by, is_retake, retake_count, parent_exam_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
         ).run(
           generateId(),
@@ -107,6 +137,9 @@ router.post(
           result,
           certificateNo || null,
           examined_by || "",
+          isRetakeFlag,
+          retakeCount,
+          parentExamId,
         );
       }
     });
@@ -128,17 +161,42 @@ router.post(
       if (!hasAttendance && score >= PASS_SCORE) {
         msg = `考核分数达标但出勤率不足(${attendanceRate}%)，未达到最低要求${MIN_REQUIRED_ATTENDANCE_RATE}%，按不合格处理`;
       } else if (result === "passed") {
-        msg = `考核通过，结业证号: ${certificateNo}`;
+        msg = `考核${isRetakeFlag ? "补考" : ""}通过，结业证号: ${certificateNo}`;
       } else {
-        msg = "考核未通过";
+        msg = `考核${isRetakeFlag ? "补考" : ""}未通过`;
       }
       sendResponse(res, true, msg, {
         ...(saved as object),
         attendance_rate: attendanceRate,
+        is_retake: isRetakeFlag,
+        retake_count: retakeCount,
       });
     } catch (err: any) {
       sendError(res, "保存失败: " + err.message);
     }
+  }),
+);
+
+router.get(
+  "/class/:classId/failed-list",
+  handleAsync(async (req: Request, res: Response) => {
+    const { classId } = req.params;
+    const failedList = db
+      .prepare(
+        `
+    SELECT ge.*, h.name as housekeeper_name, h.phone as housekeeper_phone,
+           h.id_card as housekeeper_id_card
+    FROM graduation_exams ge
+    LEFT JOIN housekeepers h ON ge.housekeeper_id = h.id
+    WHERE ge.class_id = ? AND ge.result = 'failed'
+    ORDER BY ge.score ASC
+  `,
+      )
+      .all(classId);
+    sendResponse(res, true, "获取补考名单成功", {
+      total: failedList.length,
+      items: failedList,
+    });
   }),
 );
 
@@ -238,11 +296,23 @@ router.post(
         if (existing) continue;
 
         const attendanceRate = calcAttendanceRate(classId, exam.housekeeper_id);
+        const makeupCount = getMakeupCount(classId, exam.housekeeper_id);
+        const retakeCount = getRetakeCount(classId, exam.housekeeper_id);
+        const hadMakeup = hasMakeup(classId, exam.housekeeper_id) ? 1 : 0;
+        const hadRetake = hasRetake(classId, exam.housekeeper_id) ? 1 : 0;
+        const wasWaitingPromoted = isWaitingPromoted(
+          classId,
+          exam.housekeeper_id,
+        )
+          ? 1
+          : 0;
+
         db.prepare(
           `
         INSERT INTO skill_records (id, housekeeper_id, class_id, training_type_id,
-          certificate_no, score, start_date, end_date, total_hours, attendance_rate)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          certificate_no, score, start_date, end_date, total_hours, attendance_rate,
+          had_makeup, had_retake, was_waiting_promoted, makeup_count, retake_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
         ).run(
           generateId(),
@@ -255,6 +325,11 @@ router.post(
           cls.end_date,
           cls.total_hours,
           attendanceRate,
+          hadMakeup,
+          hadRetake,
+          wasWaitingPromoted,
+          makeupCount,
+          retakeCount,
         );
       }
       db.prepare(
@@ -297,6 +372,49 @@ router.post(
           ? Math.round((passedCount / eligibleForExam) * 10000) / 100
           : 0;
 
+      const makeupStats = {
+        had_makeup: skillRecords.filter((s: any) => s.had_makeup === 1).length,
+        total_makeup_count: skillRecords.reduce(
+          (sum: number, s: any) => sum + (s.makeup_count || 0),
+          0,
+        ),
+      };
+
+      const allRetakeList = exams.filter(
+        (e: any) => (e.is_retake || 0) === 1 || (e.retake_count || 0) > 0,
+      );
+      const retakePassedList = allRetakeList.filter(
+        (e: any) => e.result === "passed",
+      );
+      const retakeStats = {
+        had_retake: allRetakeList.length,
+        passed_after_retake: retakePassedList.length,
+        total_retake_count: allRetakeList.reduce(
+          (sum: number, e: any) => sum + (e.retake_count || 0),
+          0,
+        ),
+        retake_pass_rate:
+          allRetakeList.length > 0
+            ? Math.round(
+                (retakePassedList.length / allRetakeList.length) * 10000,
+              ) / 100
+            : 0,
+      };
+
+      const promotedStats = {
+        count: skillRecords.filter((s: any) => s.was_waiting_promoted === 1)
+          .length,
+      };
+
+      const makeupRate =
+        eligibleForExam > 0
+          ? Math.round((makeupStats.had_makeup / eligibleForExam) * 10000) / 100
+          : 0;
+      const finalGraduationRate =
+        eligibleForExam > 0
+          ? Math.round((passedCount / eligibleForExam) * 10000) / 100
+          : 0;
+
       sendResponse(
         res,
         true,
@@ -312,6 +430,13 @@ router.post(
             pass_rate: passRate,
             min_attendance_rate: MIN_REQUIRED_ATTENDANCE_RATE,
             attendance_checks: attendanceChecks,
+            makeup_stats: {
+              ...makeupStats,
+              makeup_rate: makeupRate,
+            },
+            retake_stats: retakeStats,
+            promoted_from_waiting_stats: promotedStats,
+            final_graduation_rate: finalGraduationRate,
           },
         },
       );

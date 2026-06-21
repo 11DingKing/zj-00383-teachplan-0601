@@ -6,6 +6,8 @@ export type AttendanceStatus = "present" | "absent" | "leave";
 
 export type ExamResult = "passed" | "failed" | "pending";
 
+export type MakeupScheduleStatus = "scheduled" | "completed" | "cancelled";
+
 export interface TrainingType {
   id: string;
   name: string;
@@ -73,6 +75,34 @@ export interface ClassSchedule {
   created_at: string;
 }
 
+export interface MakeupSchedule {
+  id: string;
+  class_id: string;
+  original_schedule_id: string;
+  original_schedule_content?: string;
+  date: string;
+  start_time: string;
+  end_time: string;
+  content: string;
+  room_id?: string;
+  room_name?: string;
+  instructor_id?: string;
+  instructor_name?: string;
+  created_by?: string;
+  created_at: string;
+}
+
+export interface MakeupRegistration {
+  id: string;
+  makeup_schedule_id: string;
+  housekeeper_id: string;
+  housekeeper_name?: string;
+  original_schedule_id: string;
+  class_id: string;
+  status: MakeupScheduleStatus;
+  registered_at: string;
+}
+
 export interface Registration {
   id: string;
   class_id: string;
@@ -81,6 +111,7 @@ export interface Registration {
   housekeeper_name?: string;
   status: RegistrationStatus;
   wait_position?: number;
+  promoted_at?: string;
   registered_at: string;
 }
 
@@ -92,6 +123,9 @@ export interface Attendance {
   housekeeper_name?: string;
   status: AttendanceStatus;
   remark: string;
+  is_makeup?: number;
+  original_schedule_id?: string;
+  makeup_schedule_id?: string;
   recorded_at: string;
 }
 
@@ -105,6 +139,9 @@ export interface GraduationExam {
   result: ExamResult;
   certificate_no?: string;
   examined_by: string;
+  is_retake?: number;
+  retake_count?: number;
+  parent_exam_id?: string;
   created_at: string;
 }
 
@@ -121,6 +158,11 @@ export interface SkillRecord {
   end_date: string;
   total_hours: number;
   attendance_rate: number;
+  had_makeup?: number;
+  had_retake?: number;
+  was_waiting_promoted?: number;
+  makeup_count?: number;
+  retake_count?: number;
   recorded_at: string;
 }
 

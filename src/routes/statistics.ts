@@ -7,6 +7,11 @@ import {
   calcAttendanceRate,
   hasSufficientAttendance,
   MIN_REQUIRED_ATTENDANCE_RATE,
+  getMakeupCount,
+  hasMakeup,
+  getRetakeCount,
+  hasRetake,
+  isWaitingPromoted,
 } from "../utils/helpers";
 
 const router = Router();
@@ -79,6 +84,47 @@ router.get(
       (e) => e.result === "passed",
     ).length;
 
+    const totalRetakes = eligibleExams.filter(
+      (e) => (e.is_retake || 0) === 1 && e.result === "passed",
+    ).length;
+    const totalFailedFirst = allExams.filter(
+      (e) => (e.retake_count || 0) >= 1,
+    ).length;
+    const retakePassRate =
+      totalFailedFirst > 0
+        ? Math.round((totalRetakes / totalFailedFirst) * 10000) / 100
+        : 0;
+
+    const completedClasses = db
+      .prepare(
+        `
+    SELECT DISTINCT tc.id FROM training_classes tc
+    WHERE 1=1 ${classDateWhere.replace(/tc\./g, "tc.")} AND tc.status = 'completed'
+  `,
+      )
+      .all(...classCondParams) as any[];
+
+    let totalMakeupUsed = 0;
+    let totalEnrolledForMakeup = 0;
+    for (const cls of completedClasses) {
+      const enrolled = db
+        .prepare(
+          `SELECT COUNT(*) as c FROM registrations WHERE class_id = ? AND status = 'enrolled'`,
+        )
+        .get(cls.id) as any;
+      totalEnrolledForMakeup += enrolled.c;
+      const makeupUsed = db
+        .prepare(
+          `SELECT COUNT(DISTINCT housekeeper_id) as c FROM attendances WHERE class_id = ? AND is_makeup = 1 AND status IN ('present', 'leave')`,
+        )
+        .get(cls.id) as any;
+      totalMakeupUsed += makeupUsed.c;
+    }
+    const overallMakeupRate =
+      totalEnrolledForMakeup > 0
+        ? Math.round((totalMakeupUsed / totalEnrolledForMakeup) * 10000) / 100
+        : 0;
+
     const skillRecordsCount = (
       db
         .prepare(
@@ -89,6 +135,42 @@ router.get(
   `,
         )
         .get(...dateParams) as any
+    ).c;
+
+    const skillRecordsWithMakeup = (
+      db
+        .prepare(
+          `
+    SELECT COUNT(*) as c FROM skill_records sr
+    JOIN training_classes tc ON sr.class_id = tc.id
+    WHERE sr.had_makeup = 1 ${classDateWhere.replace(/tc\./g, "tc.")}
+  `,
+        )
+        .get(...classCondParams) as any
+    ).c;
+
+    const skillRecordsWithRetake = (
+      db
+        .prepare(
+          `
+    SELECT COUNT(*) as c FROM skill_records sr
+    JOIN training_classes tc ON sr.class_id = tc.id
+    WHERE sr.had_retake = 1 ${classDateWhere.replace(/tc\./g, "tc.")}
+  `,
+        )
+        .get(...classCondParams) as any
+    ).c;
+
+    const skillRecordsPromoted = (
+      db
+        .prepare(
+          `
+    SELECT COUNT(*) as c FROM skill_records sr
+    JOIN training_classes tc ON sr.class_id = tc.id
+    WHERE sr.was_waiting_promoted = 1 ${classDateWhere.replace(/tc\./g, "tc.")}
+  `,
+        )
+        .get(...classCondParams) as any
     ).c;
 
     const totalTrainingHours = (
@@ -127,6 +209,11 @@ router.get(
         ? Math.round((totalPassed / totalExamined) * 10000) / 100
         : 0;
 
+    const finalGraduationRate =
+      totalEnrollments > 0
+        ? Math.round((skillRecordsCount / totalEnrollments) * 10000) / 100
+        : 0;
+
     sendResponse(res, true, "获取统计概览成功", {
       period: { start_date: start_date || null, end_date: end_date || null },
       total_classes: totalClasses,
@@ -141,6 +228,16 @@ router.get(
       avg_hours_per_person: avgHoursPerPerson,
       min_required_attendance_rate: MIN_REQUIRED_ATTENDANCE_RATE,
       pass_rate_note: "通过率仅统计出勤率达标学员",
+      closed_loop_stats: {
+        total_makeup_used: totalMakeupUsed,
+        overall_makeup_rate: overallMakeupRate,
+        skill_records_with_makeup: skillRecordsWithMakeup,
+        skill_records_with_retake: skillRecordsWithRetake,
+        skill_records_promoted_from_waiting: skillRecordsPromoted,
+        total_retakes_passed: totalRetakes,
+        retake_pass_rate: retakePassRate,
+        final_graduation_rate: finalGraduationRate,
+      },
     });
   }),
 );
@@ -176,13 +273,26 @@ router.get(
       COUNT(DISTINCT CASE WHEN r.status = 'enrolled' THEN r.housekeeper_id ELSE NULL END) as unique_trainees,
       ge.class_id as exam_class_id,
       ge.housekeeper_id as exam_housekeeper_id,
-      ge.result as exam_result
+      ge.result as exam_result,
+      ge.is_retake as exam_is_retake,
+      ge.retake_count as exam_retake_count,
+      sr.class_id as sr_class_id,
+      sr.housekeeper_id as sr_housekeeper_id,
+      sr.had_makeup as sr_had_makeup,
+      sr.had_retake as sr_had_retake,
+      sr.was_waiting_promoted as sr_was_promoted,
+      sr.makeup_count as sr_makeup_count,
+      sr.retake_count as sr_retake_count
     FROM training_types tt
     LEFT JOIN training_classes tc ON tc.training_type_id = tt.id
       ${dateConditions.length > 0 ? "AND " + dateConditions.map((c) => c.replace("tc.", "tc.")).join(" AND ") : ""}
     LEFT JOIN registrations r ON r.class_id = tc.id
     LEFT JOIN graduation_exams ge ON ge.class_id = tc.id AND ge.housekeeper_id = r.housekeeper_id
-    GROUP BY tt.id, tt.name, ge.class_id, ge.housekeeper_id, ge.result
+    LEFT JOIN skill_records sr ON sr.class_id = tc.id AND sr.housekeeper_id = r.housekeeper_id
+    GROUP BY tt.id, tt.name, ge.class_id, ge.housekeeper_id, ge.result,
+             ge.is_retake, ge.retake_count,
+             sr.class_id, sr.housekeeper_id, sr.had_makeup, sr.had_retake,
+             sr.was_waiting_promoted, sr.makeup_count, sr.retake_count
     ORDER BY class_count DESC
   `,
       )
@@ -202,6 +312,14 @@ router.get(
           unique_trainees: row.unique_trainees,
           _examined: new Set(),
           _passed: new Set(),
+          _retakeFailed: new Set(),
+          _retakePassed: new Set(),
+          _hadMakeup: new Set(),
+          _hadRetake: new Set(),
+          _wasPromoted: new Set(),
+          _totalMakeupCount: 0,
+          _totalRetakeCount: 0,
+          _skillRecordsCount: new Set(),
         });
       }
       const entry = agg.get(key)!;
@@ -221,15 +339,51 @@ router.get(
           if (row.exam_result === "passed") {
             entry._passed.add(personKey);
           }
+          if (row.exam_retake_count && row.exam_retake_count >= 1) {
+            entry._retakeFailed.add(personKey);
+            if (row.exam_result === "passed") {
+              entry._retakePassed.add(personKey);
+            }
+          }
         }
+      }
+      if (row.sr_class_id && row.sr_housekeeper_id) {
+        const srKey = `${row.sr_class_id}-${row.sr_housekeeper_id}`;
+        entry._skillRecordsCount.add(srKey);
+        if (row.sr_had_makeup === 1) {
+          entry._hadMakeup.add(srKey);
+        }
+        if (row.sr_had_retake === 1) {
+          entry._hadRetake.add(srKey);
+        }
+        if (row.sr_was_promoted === 1) {
+          entry._wasPromoted.add(srKey);
+        }
+        entry._totalMakeupCount += row.sr_makeup_count || 0;
+        entry._totalRetakeCount += row.sr_retake_count || 0;
       }
     }
 
     const result = Array.from(agg.values()).map((r: any) => {
       const passed_count = r._passed.size;
       const examined_count = r._examined.size;
+      const retakeFailedCount = r._retakeFailed.size;
+      const retakePassedCount = r._retakePassed.size;
+      const hadMakeupCount = r._hadMakeup.size;
+      const totalEnrolled = r.enrollment_count;
+      const skillRecordsCount = r._skillRecordsCount.size;
+
       delete r._examined;
       delete r._passed;
+      delete r._retakeFailed;
+      delete r._retakePassed;
+      delete r._hadMakeup;
+      delete r._hadRetake;
+      delete r._wasPromoted;
+      delete r._totalMakeupCount;
+      delete r._totalRetakeCount;
+      delete r._skillRecordsCount;
+
       return {
         ...r,
         passed_count,
@@ -242,6 +396,29 @@ router.get(
           examined_count > 0
             ? Math.round((passed_count / examined_count) * 10000) / 100
             : 0,
+        makeup_stats: {
+          had_makeup_count: hadMakeupCount,
+          makeup_rate:
+            totalEnrolled > 0
+              ? Math.round((hadMakeupCount / totalEnrolled) * 10000) / 100
+              : 0,
+        },
+        retake_stats: {
+          retake_attempted_count: retakeFailedCount,
+          retake_passed_count: retakePassedCount,
+          retake_pass_rate:
+            retakeFailedCount > 0
+              ? Math.round((retakePassedCount / retakeFailedCount) * 10000) /
+                100
+              : 0,
+        },
+        final_graduation_stats: {
+          graduated_count: skillRecordsCount,
+          final_graduation_rate:
+            totalEnrolled > 0
+              ? Math.round((skillRecordsCount / totalEnrolled) * 10000) / 100
+              : 0,
+        },
         min_required_attendance_rate: MIN_REQUIRED_ATTENDANCE_RATE,
         pass_rate_note: "通过率仅统计出勤率达标学员",
       };
