@@ -81,7 +81,24 @@ function initializeDatabase() {
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (class_id) REFERENCES training_classes(id) ON DELETE CASCADE
     );
+  `);
 
+  const pragma = db
+    .prepare("PRAGMA table_info(class_schedules)")
+    .all() as any[];
+  const hasRoomId = pragma.some((c: any) => c.name === "room_id");
+  if (!hasRoomId) {
+    db.exec(
+      `ALTER TABLE class_schedules ADD COLUMN room_id TEXT REFERENCES training_rooms(id)`,
+    );
+    db.exec(`
+      UPDATE class_schedules
+      SET room_id = (SELECT room_id FROM training_classes WHERE id = class_schedules.class_id)
+      WHERE room_id IS NULL
+    `);
+  }
+
+  db.exec(`
     CREATE TABLE IF NOT EXISTS registrations (
       id TEXT PRIMARY KEY,
       class_id TEXT NOT NULL,
@@ -198,6 +215,7 @@ function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_classes_room ON training_classes(room_id);
     CREATE INDEX IF NOT EXISTS idx_schedules_class ON class_schedules(class_id);
     CREATE INDEX IF NOT EXISTS idx_schedules_datetime ON class_schedules(date, start_time);
+    CREATE INDEX IF NOT EXISTS idx_schedules_room ON class_schedules(room_id);
     CREATE INDEX IF NOT EXISTS idx_registrations_class ON registrations(class_id);
     CREATE INDEX IF NOT EXISTS idx_registrations_housekeeper ON registrations(housekeeper_id);
     CREATE INDEX IF NOT EXISTS idx_attendances_schedule ON attendances(schedule_id);

@@ -7,6 +7,7 @@ import {
   handleAsync,
   getAbsentList,
   calcAttendanceRate,
+  checkMakeupRoomScheduleConflict,
 } from "../utils/helpers";
 import { Attendance, AttendanceStatus } from "../types";
 
@@ -111,7 +112,8 @@ router.get(
     const enrolled = db
       .prepare(
         `
-    SELECT DISTINCT r.housekeeper_id, h.name as housekeeper_name, h.id_card as housekeeper_id_card
+    SELECT DISTINCT r.housekeeper_id, h.name as housekeeper_name, h.id_card as housekeeper_id_card,
+           r.promoted_at
     FROM registrations r
     LEFT JOIN housekeepers h ON r.housekeeper_id = h.id
     WHERE r.class_id = (SELECT class_id FROM class_schedules WHERE id = ?)
@@ -121,10 +123,16 @@ router.get(
       )
       .all(req.params.scheduleId);
 
+    const scheduleDate = (schedule as any).date;
+    const applicableEnrolled = enrolled.filter((e: any) => {
+      if (!e.promoted_at) return true;
+      return scheduleDate >= e.promoted_at.slice(0, 10);
+    });
+
     const byId = new Map<string, any>(
       attendances.map((a: any) => [a.housekeeper_id, a]),
     );
-    const combined = enrolled.map((e: any) => {
+    const combined = applicableEnrolled.map((e: any) => {
       const att: any | undefined = byId.get(e.housekeeper_id);
       return {
         housekeeper_id: e.housekeeper_id,
@@ -133,6 +141,7 @@ router.get(
         status: att ? att.status : null,
         remark: att ? att.remark : "",
         attendance_id: att ? att.id : null,
+        was_waiting_promoted: !!e.promoted_at,
       };
     });
 
@@ -301,6 +310,19 @@ router.post(
     if (!originalSched)
       return sendError(res, "原课程安排不存在", undefined, 404);
 
+    const targetRoomId = room_id || cls.room_id;
+    if (targetRoomId) {
+      const conflict = checkMakeupRoomScheduleConflict(
+        targetRoomId,
+        date,
+        start_time,
+        end_time,
+      );
+      if (conflict.conflict) {
+        return sendError(res, `创建补课安排失败：${conflict.message}`);
+      }
+    }
+
     const id = generateId();
     db.prepare(
       `
@@ -315,7 +337,7 @@ router.post(
       start_time,
       end_time,
       content || (originalSched as any).content || "",
-      room_id || null,
+      targetRoomId || null,
       instructor_id || null,
       created_by || "",
     );

@@ -460,7 +460,19 @@ router.get(
       SELECT cs.date, cs.start_time, cs.end_time
       FROM class_schedules cs
       JOIN training_classes tc ON cs.class_id = tc.id
-      WHERE tc.room_id = ? AND cs.date BETWEEN ? AND ?
+      WHERE cs.room_id = ? AND cs.date BETWEEN ? AND ?
+        AND tc.status != 'enrolling'
+    `,
+        )
+        .all(room.id, sd, ed);
+
+      const makeupSchedules = db
+        .prepare(
+          `
+      SELECT ms.date, ms.start_time, ms.end_time
+      FROM makeup_schedules ms
+      JOIN training_classes tc ON ms.class_id = tc.id
+      WHERE ms.room_id = ? AND ms.date BETWEEN ? AND ?
         AND tc.status != 'enrolling'
     `,
         )
@@ -472,17 +484,33 @@ router.get(
       SELECT cs.date, cs.start_time, cs.end_time, tc.status
       FROM class_schedules cs
       JOIN training_classes tc ON cs.class_id = tc.id
-      WHERE tc.room_id = ? AND cs.date BETWEEN ? AND ?
+      WHERE cs.room_id = ? AND cs.date BETWEEN ? AND ?
     `,
         )
         .all(room.id, sd, ed);
 
-      let usedMinutes = 0;
-      for (const s of schedules as any[]) {
-        const [sh, sm] = s.start_time.split(":").map(Number);
-        const [eh, em] = s.end_time.split(":").map(Number);
-        usedMinutes += eh * 60 + em - (sh * 60 + sm);
-      }
+      const allMakeupSchedules = db
+        .prepare(
+          `
+      SELECT ms.date, ms.start_time, ms.end_time, tc.status
+      FROM makeup_schedules ms
+      JOIN training_classes tc ON ms.class_id = tc.id
+      WHERE ms.room_id = ? AND ms.date BETWEEN ? AND ?
+    `,
+        )
+        .all(room.id, sd, ed);
+
+      const calcMinutes = (list: any[]) => {
+        let mins = 0;
+        for (const s of list) {
+          const [sh, sm] = s.start_time.split(":").map(Number);
+          const [eh, em] = s.end_time.split(":").map(Number);
+          mins += eh * 60 + em - (sh * 60 + sm);
+        }
+        return mins;
+      };
+
+      const usedMinutes = calcMinutes(schedules) + calcMinutes(makeupSchedules);
       const usedHours = Math.round((usedMinutes / 60) * 100) / 100;
       const utilization =
         totalAvailableHoursPerRoom > 0
@@ -496,11 +524,17 @@ router.get(
         period: { start_date: sd, end_date: ed, total_days: totalDays },
         available_hours: totalAvailableHoursPerRoom,
         scheduled_hours: usedHours,
-        schedule_count: schedules.length,
-        total_schedule_count: allSchedules.length,
-        excluded_enrolling_count: allSchedules.length - schedules.length,
+        schedule_count: schedules.length + makeupSchedules.length,
+        normal_schedule_count: schedules.length,
+        makeup_schedule_count: makeupSchedules.length,
+        total_schedule_count: allSchedules.length + allMakeupSchedules.length,
+        excluded_enrolling_count:
+          allSchedules.length +
+          allMakeupSchedules.length -
+          (schedules.length + makeupSchedules.length),
         utilization_rate: Math.min(100, utilization),
-        utilization_note: "使用率仅统计已开班/培训中/已结业班级",
+        utilization_note:
+          "使用率仅统计已开班/培训中/已结业班级，基于每节课实际占用的培训室（含补课）",
       };
     });
 

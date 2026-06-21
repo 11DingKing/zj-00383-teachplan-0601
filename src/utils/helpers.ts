@@ -69,15 +69,21 @@ export function checkRoomScheduleConflict(
   roomId: string,
   schedules: { date: string; start_time: string; end_time: string }[],
   excludeClassId?: string,
+  excludeScheduleIds?: string[],
 ): { conflict: boolean; message: string } {
   for (const sched of schedules) {
+    const excludeSchedSql =
+      excludeScheduleIds && excludeScheduleIds.length > 0
+        ? `AND cs.id NOT IN (${excludeScheduleIds.map(() => "?").join(",")})`
+        : "";
     let query = `
       SELECT cs.id, tc.name as class_name
       FROM class_schedules cs
       JOIN training_classes tc ON cs.class_id = tc.id
       WHERE cs.date = ? AND cs.class_id != ?
         AND NOT (cs.end_time <= ? OR cs.start_time >= ?)
-        AND tc.room_id = ?
+        AND cs.room_id = ?
+        ${excludeSchedSql}
     `;
     const params: any[] = [
       sched.date,
@@ -86,6 +92,9 @@ export function checkRoomScheduleConflict(
       sched.end_time,
       roomId,
     ];
+    if (excludeScheduleIds && excludeScheduleIds.length > 0) {
+      params.push(...excludeScheduleIds);
+    }
     const conflicts: any = db.prepare(query).get(...params);
     if (conflicts) {
       return {
@@ -93,6 +102,77 @@ export function checkRoomScheduleConflict(
         message: `培训室在 ${sched.date} ${sched.start_time}-${sched.end_time} 已被班级"${conflicts.class_name}"占用`,
       };
     }
+
+    const makeupQuery = `
+      SELECT ms.id, tc.name as class_name
+      FROM makeup_schedules ms
+      JOIN training_classes tc ON ms.class_id = tc.id
+      WHERE ms.date = ? AND ms.class_id != ?
+        AND NOT (ms.end_time <= ? OR ms.start_time >= ?)
+        AND ms.room_id = ?
+    `;
+    const makeupParams: any[] = [
+      sched.date,
+      excludeClassId || "",
+      sched.start_time,
+      sched.end_time,
+      roomId,
+    ];
+    const makeupConflicts: any = db.prepare(makeupQuery).get(...makeupParams);
+    if (makeupConflicts) {
+      return {
+        conflict: true,
+        message: `培训室在 ${sched.date} ${sched.start_time}-${sched.end_time} 已被班级"${makeupConflicts.class_name}"的补课安排占用`,
+      };
+    }
+  }
+  return { conflict: false, message: "" };
+}
+
+export function checkMakeupRoomScheduleConflict(
+  roomId: string,
+  date: string,
+  start_time: string,
+  end_time: string,
+  excludeMakeupScheduleId?: string,
+  _excludeClassId?: string,
+): { conflict: boolean; message: string } {
+  let query = `
+    SELECT cs.id, tc.name as class_name
+    FROM class_schedules cs
+    JOIN training_classes tc ON cs.class_id = tc.id
+    WHERE cs.date = ?
+      AND NOT (cs.end_time <= ? OR cs.start_time >= ?)
+      AND cs.room_id = ?
+  `;
+  const params: any[] = [date, start_time, end_time, roomId];
+  const conflicts: any = db.prepare(query).get(...params);
+  if (conflicts) {
+    return {
+      conflict: true,
+      message: `培训室在 ${date} ${start_time}-${end_time} 已被班级"${conflicts.class_name}"占用`,
+    };
+  }
+
+  let makeupQuery = `
+    SELECT ms.id, tc.name as class_name
+    FROM makeup_schedules ms
+    JOIN training_classes tc ON ms.class_id = tc.id
+    WHERE ms.date = ?
+      AND NOT (ms.end_time <= ? OR ms.start_time >= ?)
+      AND ms.room_id = ?
+  `;
+  const makeupParams: any[] = [date, start_time, end_time, roomId];
+  if (excludeMakeupScheduleId) {
+    makeupQuery += ` AND ms.id != ?`;
+    makeupParams.push(excludeMakeupScheduleId);
+  }
+  const makeupConflicts: any = db.prepare(makeupQuery).get(...makeupParams);
+  if (makeupConflicts) {
+    return {
+      conflict: true,
+      message: `培训室在 ${date} ${start_time}-${end_time} 已被班级"${makeupConflicts.class_name}"的补课安排占用`,
+    };
   }
   return { conflict: false, message: "" };
 }
@@ -109,11 +189,35 @@ export function getScheduleCount(classId: string): number {
   ).count;
 }
 
+export function getPromotedAt(
+  classId: string,
+  housekeeperId: string,
+): string | null {
+  const reg = db
+    .prepare(
+      `SELECT promoted_at FROM registrations WHERE class_id = ? AND housekeeper_id = ? AND status = 'enrolled'`,
+    )
+    .get(classId, housekeeperId) as any;
+  return reg ? reg.promoted_at || null : null;
+}
+
 export function calcAttendanceRate(
   classId: string,
   housekeeperId: string,
 ): number {
-  const scheduleCount = getScheduleCount(classId);
+  const promotedAt = getPromotedAt(classId, housekeeperId);
+
+  const schedules = db
+    .prepare(
+      `SELECT id, date FROM class_schedules WHERE class_id = ? ORDER BY date, start_time`,
+    )
+    .all(classId) as any[];
+
+  const applicableSchedules = promotedAt
+    ? schedules.filter((s) => s.date >= promotedAt.slice(0, 10))
+    : schedules;
+
+  const scheduleCount = applicableSchedules.length;
   if (scheduleCount === 0) return 0;
 
   const attendanceRows = db
@@ -136,11 +240,7 @@ export function calcAttendanceRate(
   }
 
   let validCount = 0;
-  const schedules = db
-    .prepare(`SELECT id FROM class_schedules WHERE class_id = ?`)
-    .all(classId) as any[];
-
-  for (const sched of schedules) {
+  for (const sched of applicableSchedules) {
     const schedId = sched.id;
     const status = originalAttendance.get(schedId);
     if (
@@ -227,7 +327,7 @@ export function getAbsentList(classId: string): any[] {
 
   const enrolled = db
     .prepare(
-      `SELECT r.housekeeper_id, h.name, h.phone
+      `SELECT r.housekeeper_id, h.name, h.phone, r.promoted_at
        FROM registrations r
        JOIN housekeepers h ON r.housekeeper_id = h.id
        WHERE r.class_id = ? AND r.status = 'enrolled'`,
@@ -237,6 +337,9 @@ export function getAbsentList(classId: string): any[] {
   const result: any[] = [];
   for (const sched of schedules) {
     for (const hk of enrolled) {
+      if (hk.promoted_at && sched.date < hk.promoted_at.slice(0, 10)) {
+        continue;
+      }
       const att = db
         .prepare(
           `SELECT status, is_makeup, makeup_schedule_id FROM attendances

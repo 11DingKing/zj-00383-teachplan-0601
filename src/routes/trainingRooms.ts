@@ -96,18 +96,39 @@ router.get(
     if (!start_date || !end_date) {
       return sendError(res, "请提供 start_date 和 end_date 参数");
     }
-    const schedules = db
+    const classSchedules = db
       .prepare(
         `
-    SELECT cs.date, cs.start_time, cs.end_time, tc.name as class_name
+    SELECT cs.date, cs.start_time, cs.end_time, tc.name as class_name,
+           'normal' as schedule_type
     FROM class_schedules cs
     JOIN training_classes tc ON cs.class_id = tc.id
-    WHERE tc.room_id = ? AND cs.date BETWEEN ? AND ?
+    WHERE cs.room_id = ? AND cs.date BETWEEN ? AND ?
     ORDER BY cs.date, cs.start_time
   `,
       )
       .all(req.params.id, start_date, end_date);
-    sendResponse(res, true, "获取占用情况成功", schedules);
+
+    const makeupSchedules = db
+      .prepare(
+        `
+    SELECT ms.date, ms.start_time, ms.end_time, tc.name as class_name,
+           'makeup' as schedule_type
+    FROM makeup_schedules ms
+    JOIN training_classes tc ON ms.class_id = tc.id
+    WHERE ms.room_id = ? AND ms.date BETWEEN ? AND ?
+    ORDER BY ms.date, ms.start_time
+  `,
+      )
+      .all(req.params.id, start_date, end_date);
+
+    const allSchedules = [...classSchedules, ...makeupSchedules].sort(
+      (a: any, b: any) => {
+        if (a.date !== b.date) return a.date < b.date ? -1 : 1;
+        return a.start_time < b.start_time ? -1 : 1;
+      },
+    );
+    sendResponse(res, true, "获取占用情况成功", allSchedules);
   }),
 );
 

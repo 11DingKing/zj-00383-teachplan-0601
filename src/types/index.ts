@@ -72,6 +72,8 @@ export interface ClassSchedule {
   start_time: string;
   end_time: string;
   content: string;
+  room_id?: string;
+  room_name?: string;
   created_at: string;
 }
 

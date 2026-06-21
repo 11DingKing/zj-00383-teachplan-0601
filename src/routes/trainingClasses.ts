@@ -167,8 +167,8 @@ router.post(
       );
 
       const insertSched = db.prepare(`
-      INSERT INTO class_schedules (id, class_id, date, start_time, end_time, content)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO class_schedules (id, class_id, date, start_time, end_time, content, room_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `);
       for (const sched of scheduleList) {
         insertSched.run(
@@ -178,6 +178,7 @@ router.post(
           sched.start_time,
           sched.end_time,
           sched.content || "",
+          room_id,
         );
       }
     });
@@ -253,7 +254,12 @@ router.get(
     const result: any = populateClass(row);
     result.schedules = db
       .prepare(
-        `SELECT * FROM class_schedules WHERE class_id = ? ORDER BY date, start_time`,
+        `
+        SELECT cs.*, tr.name as room_name
+        FROM class_schedules cs
+        LEFT JOIN training_rooms tr ON cs.room_id = tr.id
+        WHERE cs.class_id = ? ORDER BY cs.date, cs.start_time
+      `,
       )
       .all(req.params.id);
     sendResponse(res, true, "获取成功", result);
@@ -286,6 +292,7 @@ router.put(
 
     const newRoomId = room_id || existing.room_id;
     const newCapacity = capacity !== undefined ? capacity : existing.capacity;
+    const roomChanged = newRoomId !== existing.room_id;
 
     const room = db
       .prepare("SELECT * FROM training_rooms WHERE id = ?")
@@ -295,21 +302,48 @@ router.put(
       return sendError(res, `班级容量不能超过培训室容量(${room.capacity})`);
     }
 
+    const newStart = start_date || existing.start_date;
+    const newEnd = end_date || existing.end_date;
+    if (new Date(newStart) > new Date(newEnd)) {
+      return sendError(res, "开始日期不能晚于结束日期");
+    }
+
     let scheduleList: any[] = [];
     if (schedules && Array.isArray(schedules)) {
       scheduleList = schedules;
+      for (const sched of scheduleList) {
+        if (!sched.date || !sched.start_time || !sched.end_time) {
+          return sendError(res, "每条课程安排必须包含日期、开始时间和结束时间");
+        }
+        if (sched.date < newStart || sched.date > newEnd) {
+          return sendError(
+            res,
+            `课程安排日期 ${sched.date} 必须在班级起止日期 ${newStart} 至 ${newEnd} 之间`,
+          );
+        }
+      }
       const conflict = checkRoomScheduleConflict(
         newRoomId,
         scheduleList,
         req.params.id,
       );
       if (conflict.conflict) return sendError(res, conflict.message);
-    }
-
-    const newStart = start_date || existing.start_date;
-    const newEnd = end_date || existing.end_date;
-    if (new Date(newStart) > new Date(newEnd)) {
-      return sendError(res, "开始日期不能晚于结束日期");
+    } else if (roomChanged) {
+      const existingSchedules = db
+        .prepare(
+          `SELECT date, start_time, end_time FROM class_schedules WHERE class_id = ? ORDER BY date, start_time`,
+        )
+        .all(req.params.id) as any[];
+      if (existingSchedules.length > 0) {
+        const conflict = checkRoomScheduleConflict(
+          newRoomId,
+          existingSchedules,
+          req.params.id,
+        );
+        if (conflict.conflict) {
+          return sendError(res, `更换培训室失败：${conflict.message}`);
+        }
+      }
     }
 
     const tx = db.transaction(() => {
@@ -337,8 +371,8 @@ router.put(
           req.params.id,
         );
         const insertSched = db.prepare(`
-        INSERT INTO class_schedules (id, class_id, date, start_time, end_time, content)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO class_schedules (id, class_id, date, start_time, end_time, content, room_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
       `);
         for (const sched of scheduleList) {
           insertSched.run(
@@ -348,15 +382,25 @@ router.put(
             sched.start_time,
             sched.end_time,
             sched.content || "",
+            newRoomId,
           );
         }
+      } else if (roomChanged) {
+        db.prepare(
+          `UPDATE class_schedules SET room_id = ? WHERE class_id = ?`,
+        ).run(newRoomId, req.params.id);
       }
     });
 
     try {
       tx();
       const updated = populateClass(getClassWithJoins(req.params.id));
-      sendResponse(res, true, "更新成功", updated);
+      sendResponse(
+        res,
+        true,
+        roomChanged ? "更新成功，培训室占用已同步更新" : "更新成功",
+        updated,
+      );
     } catch (err: any) {
       sendError(res, "更新失败: " + err.message);
     }
